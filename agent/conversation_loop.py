@@ -5342,17 +5342,17 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    final_msg["_verification_stop_synthetic"] = True
+                    # The assistant response is real content — persist it and
+                    # emit to the UI as an interim message so the user sees the
+                    # attempted final answer before the verification loop runs.
+                    # Only the nudge is flagged synthetic so it gets stripped
+                    # from the durable transcript (#65919 §7).
+                    agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
-                    # Keep the attempted final answer in model history so the
-                    # synthetic user nudge preserves role alternation, but do
-                    # not surface it to the user as an interim answer. The
-                    # whole point of this guard is to prevent premature
-                    # "done" claims before checks run. Both the attempted
-                    # answer and the nudge are flagged synthetic so neither
-                    # persists — otherwise the resumed transcript keeps a
-                    # premature "done" with the nudge stripped, producing an
-                    # assistant→assistant adjacency. (#55733)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge,
@@ -5407,12 +5407,17 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    final_msg["_pre_verify_synthetic"] = True
-                    # Same alternation contract as verify-on-stop: keep the
-                    # attempted answer in history, follow it with a synthetic
-                    # user nudge, and don't surface the premature answer. Both
-                    # are flagged synthetic so neither persists. (#55733)
+                    # The assistant response is real content — persist it and
+                    # emit to the UI as an interim message so the user sees the
+                    # attempted final answer before the pre_verify loop runs.
+                    # Only the nudge is flagged synthetic so it gets stripped
+                    # from the durable transcript (#65919 §7).
+                    agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("pre_verify interim flush failed", exc_info=True)
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge2,

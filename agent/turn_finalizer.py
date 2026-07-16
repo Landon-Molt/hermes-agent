@@ -27,6 +27,30 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+# Verification continuation scaffolding flags: verify-on-stop / pre_verify
+# inject a synthetic user nudge to keep the agent going one more turn.
+# These nudges must be stripped from returned/live history to avoid
+# role-alternation breaks and poisoning the resumed transcript. The
+# assistant response is real content and is not flagged. (#65919 §7)
+_VERIFICATION_CONTINUATION_FLAGS = (
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+)
+
+
+def _drop_verification_continuation_scaffolding(messages) -> None:
+    """Remove verification-continuation nudge messages from *messages* in place.
+
+    Only the synthetic nudges carry these flags, so this strips just the
+    nudges while preserving the real attempted-final-answer that was
+    persisted to state.db.
+    """
+    messages[:] = [
+        m for m in messages
+        if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
+    ]
+
+
 def finalize_turn(
     agent,
     *,
@@ -191,6 +215,12 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
+        # Drop verification-continuation nudges (synthetic user messages)
+        # from the live history before the tail-assistant check — only the
+        # nudges need stripping; the assistant candidate persists in
+        # state.db. (#65919 §7)
+        _drop_verification_continuation_scaffolding(messages)
+
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
         # tool-call sequence. Without this, the session persists a
@@ -220,12 +250,18 @@ def finalize_turn(
         # single chokepoint every recovery ``break`` flows through, so the
         # invariant "delivered final_response ⇒ assistant row in transcript"
         # holds regardless of which path produced it. (#43849 / #44100)
+        #
+        # Compare content (not just role) so a verification candidate that
+        # matches the final response is not duplicated at budget
+        # exhaustion. (#65919 §7)
         if final_response and not interrupted:
-            try:
-                _tail_role = messages[-1].get("role") if messages else None
-            except Exception:
-                _tail_role = None
-            if _tail_role != "assistant":
+            _tail = messages[-1] if messages else None
+            _tail_matches_final = (
+                isinstance(_tail, dict)
+                and _tail.get("role") == "assistant"
+                and _tail.get("content") == final_response
+            )
+            if not _tail_matches_final:
                 messages.append({"role": "assistant", "content": final_response})
 
         # The model has completed its request, so replace API-local

@@ -225,11 +225,12 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_recovery_synthetic",
     "_empty_terminal_sentinel",
     "_thinking_prefill",
-    # verify-on-stop and pre_verify nudges append a synthetic assistant
-    # "done" plus a synthetic user nudge to keep the agent going one more
-    # turn before it can claim completion. Those messages exist only to
-    # drive the verification loop; persisting them poisons the resumed
-    # transcript and breaks prompt-prefix cache reuse on later turns. (#55733)
+    # verify-on-stop and pre_verify nudges append a synthetic user nudge to
+    # keep the agent going one more turn before it can claim completion.
+    # The nudge exists only to drive the verification loop; persisting it
+    # poisons the resumed transcript and breaks prompt-prefix cache reuse
+    # on later turns. The assistant candidate is NOT synthetic — it is
+    # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
@@ -4754,8 +4755,15 @@ class AIAgent:
         )
         return bool(streamed) and streamed == visible_content
 
-    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        """Surface a real mid-turn assistant commentary message to the UI layer."""
+    def _emit_interim_assistant_message(
+        self, assistant_msg: Dict[str, Any]
+    ) -> None:
+        """Surface a real mid-turn assistant commentary message to the UI layer.
+
+        Sets ``_response_was_previewed`` when the emitted text matches what
+        was already streamed, so the messaging gateway can suppress the
+        duplicate final send. (#65919 review: triple-delivery blocker)
+        """
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
@@ -4768,6 +4776,11 @@ class AIAgent:
             cb(visible, already_streamed=already_streamed)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+        # When the interim text was already delivered via streaming, mark it
+        # as previewed so the gateway's final-send suppression recognises it
+        # and doesn't deliver it a second (or third) time.
+        if already_streamed:
+            self._response_was_previewed = True
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""

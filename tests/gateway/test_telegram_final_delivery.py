@@ -67,6 +67,8 @@ async def test_turn_final_flood_immediately_delivers_missing_tail():
     adapter.delete_message.assert_not_awaited()
     assert consumer.final_response_sent is True
     assert consumer.final_content_delivered is True
+    assert consumer.final_delivery_confirmed is True
+    assert consumer.platform_message_ids == ("tail-1",)
 
 
 @pytest.mark.asyncio
@@ -139,3 +141,57 @@ async def test_telegram_long_flood_result_keeps_retry_after():
     assert result.retry_after == 30.0
 
 
+@pytest.mark.asyncio
+async def test_ambiguous_empty_tail_timeout_preserves_duplicate_suppression():
+    adapter = _adapter()
+    adapter.send.return_value = SimpleNamespace(
+        success=False,
+        error="Timed out",
+        retryable=False,
+    )
+
+    consumer = GatewayStreamConsumer(adapter, "chat-1")
+    consumer._message_id = "preview-1"
+    consumer._last_sent_text = "Final answer"
+    consumer._fallback_final_send = True
+
+    await consumer._send_fallback_final("Final answer")
+
+    adapter.delete_message.assert_not_awaited()
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is True
+    assert consumer.final_delivery_confirmed is False
+    assert consumer.final_delivery_ambiguous is True
+
+
+@pytest.mark.asyncio
+async def test_confirmed_empty_tail_send_failure_allows_gateway_retry():
+    adapter = _adapter()
+    adapter.send.return_value = SendResult(
+        success=False,
+        error="network unavailable",
+        retryable=False,
+    )
+
+    consumer = GatewayStreamConsumer(adapter, "chat-1")
+    consumer._message_id = "preview-1"
+    consumer._last_sent_text = "Final answer"
+    consumer._fallback_final_send = True
+    consumer._final_content_delivered = True
+
+    await consumer._send_fallback_final("Final answer")
+
+    adapter.delete_message.assert_not_awaited()
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+    assert consumer.final_delivery_confirmed is False
+    assert consumer.final_delivery_ambiguous is False
+
+
+def test_timeout_exception_is_treated_as_ambiguous_delivery():
+    class TimedOut(Exception):
+        pass
+
+    assert GatewayStreamConsumer._send_failure_may_have_delivered(
+        TimedOut("request timed out")
+    ) is True

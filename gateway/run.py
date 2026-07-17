@@ -4144,6 +4144,37 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     return not final_response or final_response == error_text
 
 
+def _prepare_gateway_response_for_delivery(
+    platform: Any,
+    agent_result: dict,
+    response: str,
+    *,
+    intentional_silence: bool,
+    history_len: int = 0,
+) -> str:
+    """Return the normalized, chat-safe semantic response.
+
+    This is the single pre-delivery boundary shared by the platform body and
+    ``response:delivered`` hooks. Keeping normalization and sanitization here
+    prevents hook consumers from seeing raw provider errors or credentials that
+    the chat surface itself would never receive.
+    """
+    if intentional_silence:
+        return response
+    if response == "(empty)":
+        response = (
+            "⚠️ The model returned no response after processing tool "
+            "results. This can happen with some models — try again or "
+            "rephrase your question."
+        )
+    response = _normalize_empty_agent_response(
+        agent_result,
+        response,
+        history_len=history_len,
+    )
+    return _sanitize_gateway_final_response(platform, response)
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -7239,6 +7270,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Detached response:delivered hook tasks are a named subset so shutdown
+        # can cancel and briefly drain user handlers without coupling adapter
+        # teardown to their latency.
+        self._response_delivery_hook_tasks: set[asyncio.Task] = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -15138,6 +15173,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            # Detached delivery hooks never block adapter/session lifecycle.
+            # During shutdown, cancel them and briefly let their done callbacks
+            # clean up ownership so no task is destroyed pending.
+            _delivery_hook_owner = getattr(
+                self, "_response_delivery_hook_tasks", None
+            )
+            _delivery_hook_tasks = list(_delivery_hook_owner or ())
+            for _task in _delivery_hook_tasks:
+                _task.cancel()
+            if _delivery_hook_tasks:
+                _done, _pending = await asyncio.wait(
+                    _delivery_hook_tasks,
+                    timeout=1.0,
+                )
+                if _pending:
+                    logger.warning(
+                        "%d response:delivered hook task(s) did not stop before shutdown",
+                        len(_pending),
+                    )
+            if _delivery_hook_owner is not None:
+                _delivery_hook_owner.clear()
+
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -20301,6 +20358,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # send-time is preserved. Only the in-context RENDER (prepending the
         # human-readable prefix the model sees) is gated behind
         # gateway.message_timestamps.enabled — default OFF.
+        # Fail-soft timestamp processing must never leave the post-delivery
+        # request fallback unbound.
+        _clean_message_text = message_text
         try:
             from hermes_time import get_timezone as _get_evt_tz
             from gateway.message_timestamps import (
@@ -20381,6 +20441,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                delivery_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -20438,17 +20499,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 _intentional_silence = False
 
-            # Convert the agent's internal "(empty)" sentinel into a
-            # user-friendly message.  "(empty)" means the model failed to
-            # produce visible content after exhausting all retries (nudge,
-            # prefill, empty-retry, fallback).  Sending the raw sentinel
-            # looks like a bug; a short explanation is more helpful.
-            if response == "(empty)" and not _intentional_silence:
-                response = (
-                    "⚠️ The model returned no response after processing tool "
-                    "results. This can happen with some models — try again or "
-                    "rephrase your question."
-                )
+            # Normalize empty/error output and apply the same chat-surface secret
+            # redaction before either the platform body or a post-delivery hook
+            # can observe it. Snapshot before display-only reasoning/footer
+            # decoration so digest consumers receive the semantic answer.
+            response = _prepare_gateway_response_for_delivery(
+                source.platform,
+                agent_result,
+                response,
+                intentional_silence=_intentional_silence,
+                history_len=len(history),
+            )
+            _response_for_delivery_hook = response
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
@@ -20483,14 +20545,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "clear_resume_pending failed for %s: %s",
                         session_key, _e,
                     )
-
-            # Normalize empty responses: surface errors, partial failures, and
-            # the case where agent did work but returned no text. Fix for #18765.
-            if not _intentional_silence:
-                response = _normalize_empty_agent_response(
-                    agent_result, response, history_len=len(history),
-                )
-                response = _sanitize_gateway_final_response(source.platform, response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -20947,18 +21001,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response
+            _delivery_context = agent_result.get("_response_delivery_context") or {}
+            _delivery_event = _delivery_context.get("event") or event
+            _delivery_source = _delivery_context.get("source") or source
+            _delivery_session_key = _delivery_context.get("session_key") or session_key
+            _delivery_request = _delivery_context.get("request")
+            if _delivery_request is None:
+                _delivery_request = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else _clean_message_text
+                )
+
             _already_sent = bool(agent_result.get("already_sent"))
-            # Skip when streaming TTS already delivered audio for this turn (#60671).
-            _stts_adapter = self._adapter_for_source(source)
+            _delivery_confirmed = bool(agent_result.get("delivery_confirmed"))
+            _prior_platform_message_ids = [
+                str(message_id)
+                for message_id in (
+                    agent_result.get("delivery_platform_message_ids") or []
+                )
+                if str(message_id or "")
+            ]
+            if not _already_sent and _prior_platform_message_ids:
+                from gateway.platforms.base import RESPONSE_DELIVERY_RECEIPT_KEY
+
+                # Non-success seed: BasePlatformAdapter merges these already
+                # delivered partial chunks with the later normal final send.
+                # If that final send fails, success remains false and no public
+                # response:delivered event is emitted.
+                event.metadata[RESPONSE_DELIVERY_RECEIPT_KEY] = {
+                    "success": False,
+                    "message_id": _prior_platform_message_ids[-1],
+                    "message_ids": list(_prior_platform_message_ids),
+                    "continuation_message_ids": [],
+                    "mode": "stream_partial",
+                }
+            if _already_sent and _delivery_confirmed:
+                from gateway.platforms.base import RESPONSE_DELIVERY_RECEIPT_KEY
+
+                platform_message_ids = list(_prior_platform_message_ids)
+                event.metadata[RESPONSE_DELIVERY_RECEIPT_KEY] = {
+                    "success": True,
+                    "message_id": str(
+                        agent_result.get("delivery_message_id") or ""
+                    ),
+                    "message_ids": platform_message_ids,
+                    "continuation_message_ids": [
+                        str(message_id)
+                        for message_id in (
+                            agent_result.get("delivery_continuation_message_ids")
+                            or []
+                        )
+                    ],
+                    "mode": "stream",
+                }
+            if (
+                _response_for_delivery_hook
+                and not _intentional_silence
+                and not agent_result.get("failed")
+            ):
+                self._register_response_delivered_hook(
+                    event=_delivery_event,
+                    receipt_event=event,
+                    source=_delivery_source,
+                    session_key=_delivery_session_key,
+                    session_id=session_entry.session_id,
+                    run_generation=run_generation,
+                    request_text=_delivery_request,
+                    response_text=_response_for_delivery_hook,
+                )
+
+            # Skip when streaming TTS already delivered audio for this turn
+            # (#60671), while still preserving the independent confirmed-text
+            # receipt consumed by response:delivered above.
+            _stts_adapter = self._adapter_for_source(_delivery_source)
             _streaming_tts_done = (
                 _stts_adapter is not None
-                and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
+                and bool(
+                    getattr(
+                        _stts_adapter,
+                        "_streaming_tts_turn_completed",
+                        lambda *_a, **_k: False,
+                    )(_delivery_session_key, run_generation)
+                )
             )
             if (
                 not _streaming_tts_done
-                and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
+                and self._should_send_voice_reply(
+                    _delivery_event,
+                    response,
+                    agent_messages,
+                    already_sent=_already_sent,
+                )
             ):
-                await self._send_voice_reply(event, response)
+                await self._send_voice_reply(_delivery_event, response)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -22512,8 +22648,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
+    ) -> Optional[Any]:
         """Deliver a queued response using the normal text+attachment split."""
+        send_result = None
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -22539,8 +22676,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             content=text_content,
                             finalize=True,
                         )
-                        if getattr(_edit_res, "success", False):
+                        if getattr(_edit_res, "success", None) is True:
                             _reconciled = True
+                            send_result = _edit_res
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -22551,7 +22689,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    send_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
@@ -22562,7 +22700,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return send_result
 
         synthetic_event = MessageEvent(
             text="",
@@ -22575,6 +22713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter,
             thread_metadata=metadata,
         )
+        return send_result
 
     async def _run_background_task(
         self,
@@ -26841,6 +26980,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _register_response_delivered_hook(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        session_id: str,
+        run_generation: int,
+        request_text: str,
+        response_text: str,
+        receipt_event: Optional[MessageEvent] = None,
+    ) -> None:
+        """Emit ``response:delivered`` after the adapter confirms final text.
+
+        The adapter writes a private receipt onto ``event.metadata`` only after
+        a successful text send (or a confirmed final stream/edit).  The existing
+        generation-aware post-delivery callback is the ordering boundary: it
+        runs after the main adapter pipeline, consumes the receipt exactly once,
+        then emits a fully serializable gateway-hook payload.  No live adapter
+        or runner object is exposed to user hooks.
+        """
+        if not response_text or not session_key:
+            return
+        adapter = self._adapter_for_source(source)
+        register = getattr(adapter, "register_post_delivery_callback", None)
+        if not callable(register):
+            return
+
+        from gateway.platforms.base import RESPONSE_DELIVERY_RECEIPT_KEY
+
+        platform = source.platform.value if source.platform else ""
+        inbound_message_id = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or f"run-{run_generation}"
+        )
+        delivery_metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        ) or {}
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = (source.profile or get_active_profile_name() or "default").strip()
+        except Exception:
+            profile = (source.profile or "default").strip()
+        base_context = {
+            "schema_version": 1,
+            "turn_id": f"{session_id}:{platform}:{inbound_message_id}",
+            "session_id": session_id,
+            "session_key": session_key,
+            "run_generation": int(run_generation),
+            "platform": platform,
+            "user_id": source.user_id or "",
+            "chat_id": source.chat_id or "",
+            "thread_id": str(source.thread_id) if source.thread_id else "",
+            "chat_type": source.chat_type or "",
+            "profile": profile or "default",
+            "inbound_message_id": inbound_message_id,
+            "delivery_metadata": dict(delivery_metadata),
+            "request": request_text or "",
+            "response": response_text,
+            "internal": bool(getattr(event, "internal", False)),
+        }
+
+        def _emit_if_delivered() -> None:
+            """Atomically consume a receipt, then detach user hook execution."""
+            metadata = getattr(receipt_event or event, "metadata", None)
+            if not isinstance(metadata, dict):
+                return
+            receipt = metadata.pop(RESPONSE_DELIVERY_RECEIPT_KEY, None)
+            if not isinstance(receipt, dict) or receipt.get("success") is not True:
+                return
+
+            message_ids = [
+                str(message_id)
+                for message_id in (receipt.get("message_ids") or [])
+                if str(message_id or "")
+            ]
+            delivery_message_id = str(receipt.get("message_id") or "")
+            if not message_ids and delivery_message_id:
+                message_ids = [delivery_message_id]
+            payload = {
+                **base_context,
+                "delivery_message_id": delivery_message_id,
+                "platform_message_ids": message_ids,
+                "continuation_message_ids": [
+                    str(message_id)
+                    for message_id in (
+                        receipt.get("continuation_message_ids") or []
+                    )
+                ],
+                "delivery_mode": str(receipt.get("mode") or "text"),
+                "delivered_at_unix": time.time(),
+            }
+
+            async def _emit() -> None:
+                await self.hooks.emit("response:delivered", payload)
+
+            emit_coro = _emit()
+            try:
+                task = asyncio.create_task(
+                    emit_coro,
+                    name=f"response-delivered:{base_context['turn_id']}",
+                )
+            except RuntimeError:
+                emit_coro.close()
+                logger.warning(
+                    "response:delivered hook dispatch skipped during loop shutdown for %s",
+                    base_context["turn_id"],
+                )
+                return
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is None:
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(task)
+            delivery_tasks = getattr(self, "_response_delivery_hook_tasks", None)
+            if delivery_tasks is None:
+                delivery_tasks = set()
+                self._response_delivery_hook_tasks = delivery_tasks
+            delivery_tasks.add(task)
+
+            def _done(completed: asyncio.Task) -> None:
+                background_tasks.discard(completed)
+                delivery_tasks.discard(completed)
+                if completed.cancelled():
+                    return
+                try:
+                    completed.result()
+                except Exception:
+                    logger.warning(
+                        "response:delivered hook dispatch failed for %s",
+                        base_context["turn_id"],
+                        exc_info=True,
+                    )
+
+            task.add_done_callback(_done)
+
+        register(
+            session_key,
+            _emit_if_delivered,
+            generation=run_generation,
+        )
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -28094,6 +28378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        delivery_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28114,6 +28399,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                delivery_event=delivery_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28127,6 +28413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                delivery_event=delivery_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28270,6 +28557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        delivery_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29107,24 +29395,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             """Return True only when the actual final reply reached the user."""
             if consumer is None:
                 return False
+            if getattr(consumer, "final_delivery_ambiguous", False) is True:
+                return False
+            # A successful transport result is not proof the delivered payload
+            # was complete.  When the consumer can compare exact turn-final
+            # content, a demonstrable mismatch must override both the legacy
+            # final_response_sent flag and Petra's transport-confirmed flag.
+            matcher = getattr(consumer, "delivered_final_matches", None)
+            if callable(matcher):
+                try:
+                    if matcher(final_text) is False:
+                        return False
+                except Exception:
+                    pass
+            confirmed = getattr(consumer, "final_delivery_confirmed", None)
+            if confirmed is True:
+                return True
             if getattr(consumer, "final_response_sent", False):
-                # A successful finalize call is not proof the *content* was
-                # final: the edit may have carried only the last preview
-                # snapshot while the tail generated between that snapshot and
-                # stream completion never reached any API call (#71643).
-                # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
-                matcher = getattr(consumer, "delivered_final_matches", None)
-                if callable(matcher):
-                    try:
-                        if matcher(final_text) is False:
-                            return False
-                    except Exception:
-                        pass
+                # The exact payload matcher above already vetoed stale or
+                # payload-less split delivery.  ``None`` on a non-split legacy
+                # path preserves duplicate suppression for ambiguous timeouts.
                 return True
             if previewed:
                 has_delivered_text = getattr(consumer, "has_delivered_text", None)
@@ -29645,6 +29935,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         first_response,
                         previewed=_previewed,
                     )
+                    _first_send_result = None
                     # Apply the same predicate as the normal completed-turn path.
                     # This direct queued-send branch predates intentional-silence
                     # filtering, so without this check it leaks the literal marker.
@@ -29672,7 +29963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
+                            _first_send_result = await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
                                 adapter=adapter,
@@ -29684,6 +29975,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+
+                    if (
+                        delivery_event is not None
+                        and first_response
+                        and not _delivery_result.get("failed")
+                    ):
+                        if not _intentional_silence:
+                            _first_hook_response = _prepare_gateway_response_for_delivery(
+                                source.platform,
+                                _delivery_result,
+                                first_response,
+                                intentional_silence=False,
+                            )
+                            self._register_response_delivered_hook(
+                                event=delivery_event,
+                                source=source,
+                                session_key=session_key,
+                                session_id=session_id,
+                                run_generation=run_generation,
+                                request_text=(
+                                    persist_user_message
+                                    if persist_user_message is not None
+                                    else message
+                                ),
+                                response_text=_first_hook_response,
+                            )
+                            from gateway.platforms.base import (
+                                RESPONSE_DELIVERY_RECEIPT_KEY,
+                                ordered_send_result_message_ids,
+                            )
+
+                            if _already_streamed:
+                                _first_ids = [
+                                    str(message_id)
+                                    for message_id in (
+                                        getattr(_sc, "platform_message_ids", ()) or ()
+                                    )
+                                    if str(message_id or "")
+                                ]
+                                delivery_event.metadata[
+                                    RESPONSE_DELIVERY_RECEIPT_KEY
+                                ] = {
+                                    "success": True,
+                                    "message_id": (
+                                        _first_ids[-1] if _first_ids else ""
+                                    ),
+                                    "message_ids": _first_ids,
+                                    "continuation_message_ids": (
+                                        _first_ids[:-1] if _first_ids else []
+                                    ),
+                                    "mode": "stream",
+                                }
+                            elif getattr(_first_send_result, "success", False) is True:
+                                _first_ids = ordered_send_result_message_ids(
+                                    _first_send_result
+                                )
+                                delivery_event.metadata[
+                                    RESPONSE_DELIVERY_RECEIPT_KEY
+                                ] = {
+                                    "success": True,
+                                    "message_id": str(
+                                        getattr(_first_send_result, "message_id", "")
+                                        or ""
+                                    ),
+                                    "message_ids": _first_ids,
+                                    "continuation_message_ids": [
+                                        str(message_id)
+                                        for message_id in (
+                                            getattr(
+                                                _first_send_result,
+                                                "continuation_message_ids",
+                                                (),
+                                            )
+                                            or ()
+                                        )
+                                    ],
+                                    "mode": "text",
+                                }
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -29723,6 +30092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_delivery_event = pending_event
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -29798,6 +30168,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                if next_delivery_event is None:
+                    next_delivery_event = MessageEvent(
+                        text=next_message or "",
+                        message_type=MessageType.TEXT,
+                        source=next_source,
+                        message_id=(
+                            f"queued-{run_generation}-{_interrupt_depth + 1}"
+                        ),
+                        internal=True,
+                    )
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -29810,6 +30191,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    delivery_event=next_delivery_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -29907,6 +30289,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
         if isinstance(response, dict) and not response.get("failed"):
+            _stream_platform_message_ids = [
+                str(message_id)
+                for message_id in (
+                    getattr(_sc, "platform_message_ids", ()) or ()
+                )
+                if str(message_id or "")
+            ]
+            if _stream_platform_message_ids:
+                # Preserve successful partial stream/fallback chunks even when
+                # the adapter must perform a normal final send later.
+                response["delivery_platform_message_ids"] = list(
+                    _stream_platform_message_ids
+                )
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already
@@ -29955,14 +30350,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 previewed=_previewed,
             )
             if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+                _delivery_ambiguous = bool(
+                    _sc and getattr(_sc, "final_delivery_ambiguous", False)
+                )
+                _delivery_confirmed = bool(
+                    _streamed or (_content_delivered and not _delivery_ambiguous)
+                )
+                platform_message_ids = list(_stream_platform_message_ids)
+                delivery_message_id = (
+                    platform_message_ids[-1]
+                    if platform_message_ids
+                    else str(getattr(_sc, "message_id", "") or "")
+                )
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery state confirmed=%s ambiguous=%s (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
+                    _delivery_confirmed,
+                    _delivery_ambiguous,
                     _streamed,
                     _previewed,
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                response["delivery_confirmed"] = _delivery_confirmed
+                response["delivery_ambiguous"] = _delivery_ambiguous
+                response["delivery_message_id"] = delivery_message_id
+                response["delivery_platform_message_ids"] = platform_message_ids
+                response["delivery_continuation_message_ids"] = (
+                    platform_message_ids[:-1] if platform_message_ids else []
+                )
             elif not _is_empty_sentinel and not _transformed and _stale_finalized and _sc is not None:
                 # Stale finalize (#71643): the streamed message holds only the
                 # last preview snapshot. Prefer editing it up to the complete
@@ -29992,7 +30408,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             finalize=True,
                         )
                         if getattr(_reconcile_res, "success", True):
+                            from gateway.platforms.base import (
+                                ordered_send_result_message_ids,
+                            )
+
+                            edit_message_ids = ordered_send_result_message_ids(
+                                _reconcile_res,
+                                edited_message_id=_sc_msg_id,
+                            )
+                            platform_message_ids = list(
+                                dict.fromkeys(
+                                    [*_stream_platform_message_ids, *edit_message_ids]
+                                )
+                            )
                             response["already_sent"] = True
+                            response["delivery_confirmed"] = True
+                            response["delivery_ambiguous"] = False
+                            response["delivery_message_id"] = (
+                                platform_message_ids[-1]
+                                if platform_message_ids
+                                else str(_sc_msg_id)
+                            )
+                            response["delivery_platform_message_ids"] = (
+                                platform_message_ids
+                            )
+                            response["delivery_continuation_message_ids"] = (
+                                platform_message_ids[:-1]
+                                if platform_message_ids
+                                else []
+                            )
                             logger.info(
                                 "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
                                 session_key or "?", _sc_msg_id,
@@ -30019,17 +30463,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False) is True:
+                            from gateway.platforms.base import (
+                                ordered_send_result_message_ids,
+                            )
+
+                            edit_message_ids = ordered_send_result_message_ids(
+                                _edit_result,
+                                edited_message_id=_sc_msg_id,
+                            )
+                            platform_message_ids = list(
+                                dict.fromkeys(
+                                    [*_stream_platform_message_ids, *edit_message_ids]
+                                )
+                            )
+                            response["already_sent"] = True
+                            response["delivery_confirmed"] = True
+                            response["delivery_ambiguous"] = False
+                            response["delivery_message_id"] = (
+                                platform_message_ids[-1]
+                                if platform_message_ids
+                                else ""
+                            )
+                            response["delivery_platform_message_ids"] = (
+                                platform_message_ids
+                            )
+                            response["delivery_continuation_message_ids"] = (
+                                platform_message_ids[:-1]
+                                if platform_message_ids
+                                else []
+                            )
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Streamed-message edit was not delivered for session %s; falling back to normal final send: %s",
+                                session_key or "?",
+                                getattr(_edit_result, "error", None) or "edit returned unsuccessful result",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
@@ -30081,6 +30560,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _rpe:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+
+        if isinstance(response, dict) and delivery_event is not None:
+            response["_response_delivery_context"] = {
+                "event": delivery_event,
+                "source": source,
+                "session_key": session_key,
+                "request": (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message
+                ),
+            }
 
         return response
 

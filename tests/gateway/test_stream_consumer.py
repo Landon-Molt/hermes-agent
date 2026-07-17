@@ -788,6 +788,7 @@ class TestEditOverflowSplitAndDeliver:
 
         # Seed the consumer as if a first send succeeded already.
         consumer._message_id = "msg_initial"
+        consumer._track_preview_id("msg_initial")
         consumer._last_sent_text = "old"
         consumer._already_sent = True
 
@@ -797,6 +798,11 @@ class TestEditOverflowSplitAndDeliver:
         assert ok is True
         # Consumer advanced to the latest continuation id.
         assert consumer._message_id == "msg_continuation_2"
+        assert consumer.platform_message_ids == (
+            "msg_initial",
+            "msg_continuation_1",
+            "msg_continuation_2",
+        )
         # Skip-if-same cache reset so the next edit doesn't false-positive.
         assert consumer._last_sent_text == ""
         # on_new_message fired so the tool-progress bubble breaks below

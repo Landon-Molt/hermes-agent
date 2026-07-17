@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import ordered_send_result_message_ids
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -301,6 +302,13 @@ class GatewayStreamConsumer:
         # (#78541) — that combination was swallowing complete Telegram group
         # replies after an early/partial multi-message delivery.
         self._turn_split_delivery = False
+        # Ambiguous transport failures (notably a fresh-final write timeout)
+        # preserve duplicate suppression without claiming confirmed delivery.
+        self._final_delivery_ambiguous = False
+        # Every successful content send/edit id, de-duplicated in first-seen
+        # platform order. Sets used for preview cleanup intentionally cannot
+        # serve this correlation contract because they discard order.
+        self._platform_message_ids: list[str] = []
         self._delivered_commentary_texts: list[str] = []
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
@@ -406,6 +414,24 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    @property
+    def final_delivery_confirmed(self) -> bool:
+        """True only when the final text has a positive platform result."""
+        return bool(
+            (self._final_response_sent or self._final_content_delivered)
+            and not self._final_delivery_ambiguous
+        )
+
+    @property
+    def final_delivery_ambiguous(self) -> bool:
+        """True when duplicate suppression is retained without confirmation."""
+        return self._final_delivery_ambiguous
+
+    @property
+    def platform_message_ids(self) -> tuple[str, ...]:
+        """All successful streamed response message ids in platform order."""
+        return tuple(self._platform_message_ids)
 
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
@@ -636,6 +662,7 @@ class GatewayStreamConsumer:
         self._final_content_delivered = False
         self._delivered_final_text = None
         self._turn_split_delivery = False
+        self._final_delivery_ambiguous = False
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -1595,13 +1622,16 @@ class GatewayStreamConsumer:
                 if delivery == "ambiguous":
                     # A timeout may mean Telegram accepted the send but the
                     # client never received the response. Preserve duplicate
-                    # suppression for that one uncertain outcome.
+                    # suppression for that one uncertain outcome without
+                    # claiming confirmed platform delivery.
                     self._final_content_delivered = True
+                    self._final_delivery_ambiguous = True
                 else:
                     # A confirmed failure leaves the gateway free to perform
                     # its normal final send.
                     self._final_response_sent = False
                     self._final_content_delivered = False
+                    self._final_delivery_ambiguous = False
                 return
             # Nothing new to send — the visible partial already matches final text.
             # BUT: if final_text itself has meaningful content (e.g. a timeout
@@ -1710,6 +1740,7 @@ class GatewayStreamConsumer:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
+            self._track_preview_ids_from_result(result)
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             # Each fallback chunk is a fresh platform message — notify
@@ -1753,6 +1784,7 @@ class GatewayStreamConsumer:
         # substitutes the unsplit ledger so the sealed heads count as
         # delivered too (#78541).
         self._record_turn_final_payload(final_text)
+        self._final_delivery_ambiguous = False
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -1819,6 +1851,7 @@ class GatewayStreamConsumer:
                     )
 
         self._segment_preview_message_ids = set()
+        self._track_preview_ids_from_result(result)
         self._message_id = new_message_id or "__no_edit__"
         self._already_sent = True
         self._final_response_sent = True
@@ -1835,6 +1868,7 @@ class GatewayStreamConsumer:
         self._delivered_final_text = ensure_closed_code_fences(
             self._clean_for_display(final_text or "")
         ).strip()
+        self._final_delivery_ambiguous = False
         self._last_sent_text = final_text
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -2088,6 +2122,9 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                # Keep the platform id available when this exact commentary is
+                # later recognized as the final response by response_previewed.
+                self._track_preview_ids_from_result(result)
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
@@ -2153,24 +2190,33 @@ class GatewayStreamConsumer:
                 return cap
         return base
 
+    def _track_platform_message_id(self, message_id: Optional[str]) -> None:
+        if not message_id or message_id == "__no_edit__":
+            return
+        value = str(message_id)
+        if value not in self._platform_message_ids:
+            self._platform_message_ids.append(value)
+
     def _track_preview_id(self, message_id: Optional[str]) -> None:
         """Record a real preview message id for finalization cleanup."""
         if message_id and message_id != "__no_edit__":
             message_id = str(message_id)
             self._preview_message_ids.add(message_id)
             self._segment_preview_message_ids.add(message_id)
+            self._track_platform_message_id(message_id)
 
-    def _track_preview_ids_from_result(self, result: Any) -> None:
-        """Record every message id a send/edit result exposes: the primary id
-        plus any continuation ids from an oversized split
-        (``continuation_message_ids`` or ``raw_response['message_ids']``)."""
-        self._track_preview_id(getattr(result, "message_id", None))
-        for mid in (getattr(result, "continuation_message_ids", None) or ()):
-            self._track_preview_id(mid)
-        raw = getattr(result, "raw_response", None) or {}
-        if isinstance(raw, dict):
-            for mid in (raw.get("message_ids") or ()):
-                self._track_preview_id(mid)
+    def _track_preview_ids_from_result(
+        self,
+        result: Any,
+        *,
+        edited_message_id: Optional[str] = None,
+    ) -> None:
+        """Record successful result ids for cleanup and ordered correlation."""
+        for message_id in ordered_send_result_message_ids(
+            result,
+            edited_message_id=edited_message_id,
+        ):
+            self._track_preview_id(message_id)
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Return True when the adapter would rather finalize a streamed reply
@@ -2242,6 +2288,7 @@ class GatewayStreamConsumer:
             return False
         if not getattr(result, "success", False):
             return False
+        self._track_preview_ids_from_result(result)
         # Adopt the new message id as the current message so subsequent
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.
@@ -2321,6 +2368,7 @@ class GatewayStreamConsumer:
         self._final_content_delivered = False
         self._delivered_final_text = None
         self._turn_split_delivery = False
+        self._final_delivery_ambiguous = False
         logger.info(
             "Suppressed streamed intentional-silence marker (chat=%s)",
             self.chat_id,
@@ -2509,8 +2557,14 @@ class GatewayStreamConsumer:
                     if result.success:
                         self._already_sent = True
                         # Record any continuation fragments an oversized edit
-                        # split off, so fresh-final can clean them all up.
-                        self._track_preview_ids_from_result(result)
+                        # split off, so fresh-final can clean them all up. The
+                        # edited target is the first platform id only when the
+                        # result actually exposes continuations; normal edits use
+                        # the successful SendResult id (which may be remapped).
+                        self._track_preview_ids_from_result(
+                            result,
+                            edited_message_id=self._message_id,
+                        )
                         # Adapter may have split-and-delivered an oversized
                         # edit across the original message + N continuations.
                         # When that happens, ``message_id`` is the LAST visible

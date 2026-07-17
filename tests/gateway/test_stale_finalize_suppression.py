@@ -247,6 +247,12 @@ async def test_stale_finalize_does_not_suppress_complete_response(
             "already_sent=True but neither an edit nor the primary send "
             "carried the complete response"
         )
+        # Petra's response:delivered hook must be gated by the successful
+        # reconciliation edit/send, not merely by duplicate-suppression state.
+        assert result.get("delivery_confirmed") is True
+        assert result.get("delivery_ambiguous") is False
+        assert result.get("delivery_message_id")
+        assert result["delivery_message_id"] in result["delivery_platform_message_ids"]
 
 
 @pytest.mark.asyncio

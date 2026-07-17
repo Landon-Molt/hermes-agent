@@ -14,6 +14,7 @@ Events:
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
+  - response:delivered  -- Platform confirms an agent text response was delivered
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
@@ -32,6 +33,34 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   response     -- agent response text (truncated to 500 chars)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+
+Context dict passed to ``response:delivered`` handlers (schema version 1):
+  turn_id                 -- stable session/platform/inbound-message correlation id
+  session_id/session_key  -- Hermes session identifiers
+  run_generation          -- generation that produced this response
+  platform/profile        -- effective platform and Hermes profile (never blank)
+  user_id/chat_id/thread_id/chat_type
+  inbound_message_id      -- effective inbound id for this response; queued
+                             follow-ups use their own MessageEvent/id
+  request/response         -- complete request and normalized, secret-sanitized
+                             semantic response (not display footer/reasoning)
+  delivery_message_id     -- final successful platform message id
+  platform_message_ids    -- complete de-duplicated successful ids in platform
+                             delivery order, including stream/split/edit chunks
+  continuation_message_ids -- compatibility view of adapter continuation ids
+  delivery_mode           -- text, stream, or tts_caption
+  delivery_metadata       -- exact platform thread/reply routing metadata
+  delivered_at_unix       -- receipt-consumption timestamp
+  internal                -- whether the effective MessageEvent was internal
+
+``response:delivered`` fires exactly once per successfully delivered agent text
+response. A send attempt or ambiguous timeout is not confirmation and does not
+produce this event. Intentional silence, commands, failed/stale generations, and
+failed sends do not fire it. Each in-band queued follow-up is correlated to its
+own effective event/source/request. Dispatch consumes the success receipt
+atomically and runs handlers in an owned background task, so hook latency does
+not block adapter teardown, session release, or later ordered post-delivery
+callbacks; outstanding tasks are cancelled and drained during gateway shutdown.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

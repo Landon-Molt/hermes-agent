@@ -85,7 +85,46 @@ async def handle(event_type: str, context: dict):
 | `agent:end` | Agent finishes processing | same keys as `agent:start`, plus `response` (truncated to 500 chars) |
 | `reaction:added` | An emoji reaction was added to a message the bot can see (Slack adapter currently). Requires the `reactions:read` scope + the `reaction_added` bot event subscription; the bot must be a member of the channel. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
 | `reaction:removed` | An emoji reaction was removed from a message the bot can see. Requires the `reaction_removed` bot event subscription. | same shape as `reaction:added` |
+| `response:delivered` | A complete agent text response is positively confirmed delivered by the platform | `turn_id`, `session_id`, `session_key`, `run_generation`, `platform`, `profile`, `chat_id`, `thread_id`, `inbound_message_id`, `request`, `response`, `delivery_message_id`, `platform_message_ids`, `delivery_metadata`, `internal` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
+
+#### Post-delivery responses
+
+`response:delivered` is different from `agent:end`: it fires exactly once for
+each complete agent text response after the platform adapter reports a positive
+success receipt (or after streaming has positively confirmed final-content
+delivery). A send attempt is not enough. In particular, an ambiguous fresh-final
+timeout may retain duplicate suppression, but it never creates a success receipt
+or this event. Failed sends, stale/invalidated generations, empty or intentional-
+silence responses, and slash-command replies also do not fire it.
+
+Queued in-band follow-ups are separate responses: each successful delivery emits
+its own event correlated to that follow-up's effective `MessageEvent`, source,
+request, `inbound_message_id`, and profile rather than to the outer event that
+started the queue drain. Internal events are included and identified by
+`internal: true`; `profile` is always explicit (`default` for the default profile
+or the routed profile name in multiplexed mode).
+
+The payload has `schema_version: 1` and includes the full user request and the
+normalized, chat-sanitized semantic agent response, stable routing identifiers,
+the run generation, delivery mode, profile, exact thread metadata, and platform
+message IDs. `delivery_message_id` is the final successful ID.
+`platform_message_ids` is the complete de-duplicated list of successful IDs in
+platform delivery order, including streaming messages, split-overflow/fallback
+chunks, and transformed edits. Successful edits use the IDs returned by the edit
+operation, not a stale pre-edit target.
+
+The `response` value is captured after empty/error normalization and user-facing
+secret sanitization, but before display-only reasoning/footer decoration. Because
+`request` and `response` are not truncated, treat post-delivery hooks as trusted
+local code.
+
+The post-delivery callback consumes the receipt atomically, then starts an owned
+and logged asynchronous hook task. Slow handlers therefore do not block adapter
+or session teardown and do not delay later ordered post-delivery callbacks.
+Outstanding delivery-hook tasks are cancelled and drained during gateway
+shutdown. Handlers should still enqueue long-running external work rather than
+assuming it can outlive shutdown.
 
 #### Wildcard Matching
 

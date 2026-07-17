@@ -2290,6 +2290,15 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+# Internal, per-MessageEvent receipt written only after the platform confirms
+# delivery of the final user-visible response text.  GatewayRunner consumes it
+# from a generation-aware post-delivery callback before emitting the public
+# ``response:delivered`` gateway-hook event.  Keeping the receipt on the event
+# avoids introducing a second callback registry or leaking live adapter objects
+# into serializable hook context.
+RESPONSE_DELIVERY_RECEIPT_KEY = "_hermes_response_delivery_receipt"
+
+
 @dataclass
 class MessageEvent:
     """
@@ -2488,6 +2497,47 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+
+
+def ordered_send_result_message_ids(
+    result: Any,
+    *,
+    edited_message_id: Optional[str] = None,
+) -> list[str]:
+    """Return every successful platform message id in delivery order.
+
+    ``SendResult.message_id`` is commonly the *last* visible id, while
+    ``continuation_message_ids`` has two established adapter shapes: edit
+    overflows list newly-created continuations, and split sends may list every
+    id except the last.  ``raw_response['message_ids']`` is authoritative when
+    present.  For an overflow edit, ``edited_message_id`` supplies the original
+    first chunk; for a normal edit we intentionally trust the result's actual id
+    instead of reporting a stale pre-edit target.
+    """
+    if result is None or getattr(result, "success", False) is not True:
+        return []
+
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict) and isinstance(raw.get("message_ids"), (list, tuple)):
+        candidates = list(raw["message_ids"])
+    else:
+        continuations = list(
+            getattr(result, "continuation_message_ids", ()) or ()
+        )
+        candidates = []
+        if continuations and edited_message_id:
+            candidates.append(edited_message_id)
+        candidates.extend(continuations)
+        candidates.append(getattr(result, "message_id", None))
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "")
+        if value and value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -6211,6 +6261,33 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                current = event.metadata.get(RESPONSE_DELIVERY_RECEIPT_KEY)
+                prior_ids = (
+                    list(current.get("message_ids") or [])
+                    if isinstance(current, dict)
+                    else []
+                )
+                final_ids = ordered_send_result_message_ids(result)
+                message_ids = list(
+                    dict.fromkeys(
+                        [
+                            *(str(value) for value in prior_ids if str(value or "")),
+                            *final_ids,
+                        ]
+                    )
+                )
+                event.metadata[RESPONSE_DELIVERY_RECEIPT_KEY] = {
+                    "success": True,
+                    "message_id": str(getattr(result, "message_id", "") or ""),
+                    "message_ids": message_ids,
+                    "continuation_message_ids": [
+                        str(message_id)
+                        for message_id in (
+                            getattr(result, "continuation_message_ids", ()) or ()
+                        )
+                    ],
+                    "mode": "text",
+                }
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6454,6 +6531,17 @@ class BasePlatformAdapter(ABC):
                                 and getattr(tts_result, "success", False)
                             )
                         )
+                        if _tts_caption_delivered:
+                            message_ids = ordered_send_result_message_ids(tts_result)
+                            event.metadata[RESPONSE_DELIVERY_RECEIPT_KEY] = {
+                                "success": True,
+                                "message_id": str(
+                                    getattr(tts_result, "message_id", "") or ""
+                                ),
+                                "message_ids": message_ids,
+                                "continuation_message_ids": [],
+                                "mode": "tts_caption",
+                            }
                     finally:
                         try:
                             os.remove(_tts_path)

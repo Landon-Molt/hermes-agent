@@ -2,10 +2,12 @@
 
 import asyncio
 import importlib
+import inspect
 import sys
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -197,6 +199,36 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
                 error_kind="transient",
             )
         return await super().edit_message(chat_id, message_id, content)
+
+
+class FailingMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=False, error="edit unsupported")
+
+
+class RemappedMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="edit-confirmed-id")
 
 
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -1006,6 +1038,8 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    delivery_event=None,
+    return_runner=False,
 ):
     if config_data:
         import yaml
@@ -1022,6 +1056,8 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    runner.hooks = AsyncMock()
+    runner._background_tasks = set()
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1038,6 +1074,8 @@ async def _run_with_agent(
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
+    if delivery_event is not None:
+        runner._session_run_generation[session_key] = 7
     if pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
@@ -1053,7 +1091,11 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        run_generation=7 if delivery_event is not None else None,
+        delivery_event=delivery_event,
     )
+    if return_runner:
+        return adapter, result, runner
     return adapter, result
 
 
@@ -1226,17 +1268,71 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
         chat_id="!room:matrix.example.org",
         chat_type="group",
         thread_id="$thread",
-        adapter_cls=MetadataEditProgressCaptureAdapter,
+        adapter_cls=RemappedMetadataEditProgressCaptureAdapter,
     )
 
     # Final delivery happened (no duplicate send fallback).
     assert result.get("already_sent") is True
+    assert result["delivery_message_id"] == "edit-confirmed-id"
+    assert result["delivery_platform_message_ids"] == [
+        "progress-1",
+        "edit-confirmed-id",
+    ]
     # The transformed final text reached the user — appended portion is present
     # in an edit_message call (not just in the streamed sends).
     edited_texts = [e["content"] for e in adapter.edits]
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_transformed_stream_edit_falls_back_to_normal_send(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-edit-failure",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=FailingMetadataEditProgressCaptureAdapter,
+    )
+
+    assert adapter.edits
+    assert result.get("already_sent") is not True
+    assert result["final_response"].endswith("[plugin appended this]")
+
+    async def _handler(_event):
+        return result["final_response"]
+
+    adapter.set_message_handler(_handler)
+    source = SessionSource(
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+    )
+    event = MessageEvent(
+        text="deliver transformed final",
+        source=source,
+        message_id="msg-transform-fallback",
+    )
+    session_key = "agent:main:matrix:group:!room:matrix.example.org:$thread"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    sent_before = len(adapter.sent)
+
+    await adapter._process_message_background(event, session_key)
+
+    newly_sent = adapter.sent[sent_before:]
+    assert [item["content"] for item in newly_sent] == [result["final_response"]]
 
 
 @pytest.mark.asyncio
@@ -1379,6 +1475,97 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_queued_followups_emit_once_with_each_effective_event(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    outer_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+        user_id="outer-user",
+    )
+    outer_event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=outer_source,
+        message_id="outer-inbound",
+    )
+    adapter, result, runner = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-deliveries",
+        pending_text="queued follow-up",
+        config_data={
+            "display": {"interim_assistant_messages": False},
+            "streaming": {"enabled": False},
+        },
+        delivery_event=outer_event,
+        return_runner=True,
+    )
+
+    # The first response was delivered in-band before the recursive follow-up.
+    await asyncio.sleep(0)
+    first_events = [
+        call.args[1]
+        for call in runner.hooks.emit.await_args_list
+        if call.args and call.args[0] == "response:delivered"
+    ]
+    assert len(first_events) == 1
+    assert first_events[0]["inbound_message_id"] == "outer-inbound"
+    assert first_events[0]["request"] == "hello"
+    assert first_events[0]["response"] == "final response 1"
+
+    # The leaf response carries the queued event, not the outer event, to the
+    # normal BasePlatformAdapter delivery boundary.
+    delivery = result["_response_delivery_context"]
+    queued_event = delivery["event"]
+    assert queued_event.message_id == "queued-1"
+    assert delivery["request"] == "queued follow-up"
+    runner._register_response_delivered_hook(
+        event=queued_event,
+        source=delivery["source"],
+        session_key=delivery["session_key"],
+        session_id="sess-queued-deliveries",
+        run_generation=7,
+        request_text=delivery["request"],
+        response_text=result["final_response"],
+    )
+    queued_event.metadata[base_platform.RESPONSE_DELIVERY_RECEIPT_KEY] = {
+        "success": True,
+        "message_id": "queued-out",
+        "message_ids": ["queued-out"],
+        "mode": "text",
+    }
+    callback = adapter.pop_post_delivery_callback(
+        delivery["session_key"], generation=7
+    )
+    assert callback is not None
+    callback_result = callback()
+    if inspect.isawaitable(callback_result):
+        await callback_result
+    await asyncio.gather(*list(runner._background_tasks))
+
+    delivered_events = [
+        call.args[1]
+        for call in runner.hooks.emit.await_args_list
+        if call.args and call.args[0] == "response:delivered"
+    ]
+    assert [item["inbound_message_id"] for item in delivered_events] == [
+        "outer-inbound",
+        "queued-1",
+    ]
+    assert [item["request"] for item in delivered_events] == [
+        "hello",
+        "queued follow-up",
+    ]
+    assert [item["response"] for item in delivered_events] == [
+        "final response 1",
+        "final response 2",
+    ]
 
 
 @pytest.mark.asyncio

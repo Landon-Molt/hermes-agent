@@ -158,7 +158,9 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_streaming_turn(
+    monkeypatch, tmp_path, agent_cls, session_id, *, adapter=None
+):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -183,7 +185,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = FinalizeCaptureAdapter()
+    adapter = adapter or FinalizeCaptureAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -205,6 +207,28 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
         session_key="agent:main:telegram:group:-1001",
     )
     return adapter, result
+
+
+class UnconfirmedReconcileAdapter(FinalizeCaptureAdapter):
+    """Return no affirmative ACK only for the complete-response edit."""
+
+    def __init__(self, reconcile_result):
+        super().__init__()
+        self.reconcile_result = reconcile_result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ):
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if content == FULL_RESPONSE:
+            return self.reconcile_result
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +268,29 @@ async def test_stale_finalize_does_not_suppress_complete_response(
         assert result.get("delivery_ambiguous") is False
         assert result.get("delivery_message_id")
         assert result["delivery_message_id"] in result["delivery_platform_message_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reconcile_result",
+    [None, SimpleNamespace(message_id="m-unconfirmed")],
+    ids=["none", "missing-success"],
+)
+async def test_unconfirmed_stale_reconcile_falls_through_to_normal_send(
+    monkeypatch, tmp_path, reconcile_result
+):
+    adapter = UnconfirmedReconcileAdapter(reconcile_result)
+    _, result = await _run_streaming_turn(
+        monkeypatch,
+        tmp_path,
+        StalePrefixAgent,
+        f"sess-71643-unconfirmed-{reconcile_result is None}",
+        adapter=adapter,
+    )
+
+    assert any(edit["content"] == FULL_RESPONSE for edit in adapter.edits)
+    assert result.get("already_sent") is not True
+    assert result.get("delivery_confirmed") is not True
 
 
 @pytest.mark.asyncio

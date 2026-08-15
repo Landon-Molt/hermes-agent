@@ -6,8 +6,10 @@ Covers:
 - _contains_gateway_lifecycle_command pattern matching
 """
 
+import base64
 import json
 import os
+import struct
 from argparse import Namespace
 
 import pytest
@@ -16,6 +18,102 @@ from hermes_cli.cron import (
     _contains_gateway_lifecycle_command,
     cron_command,
 )
+
+
+def _valid_macho64(payload: bytes = b"") -> bytes:
+    """Build a minimal structurally valid little-endian Mach-O executable."""
+    header_size = 32
+    command_size = 72
+    file_size = header_size + command_size + len(payload)
+    header = b"\xcf\xfa\xed\xfe" + struct.pack(
+        "<iiIIIII",
+        0x0100000C,
+        0,
+        2,
+        1,
+        command_size,
+        0,
+        0,
+    )
+    segment = struct.pack(
+        "<II16sQQQQIIII",
+        0x19,
+        command_size,
+        b"__TEXT\x00" * 2,
+        0,
+        file_size,
+        0,
+        file_size,
+        7,
+        5,
+        0,
+        0,
+    )
+    return header + segment + payload
+
+
+def _valid_fat_macho() -> bytes:
+    thin = _valid_macho64()
+    offset = 28
+    header = b"\xca\xfe\xba\xbe" + struct.pack(">I", 1)
+    architecture = struct.pack(
+        ">iiIII", 0x0100000C, 0, offset, len(thin), 2
+    )
+    return header + architecture + thin
+
+
+def _valid_elf64(payload: bytes = b"") -> bytes:
+    header_size = 64
+    program_size = 56
+    file_size = header_size + program_size + len(payload)
+    identifier = b"\x7fELF\x02\x01\x01" + b"\x00" * 9
+    header = identifier + struct.pack(
+        "<HHIQQQIHHHHHH",
+        2,
+        0x3E,
+        1,
+        0x400000,
+        header_size,
+        0,
+        0,
+        header_size,
+        program_size,
+        1,
+        64,
+        0,
+        0,
+    )
+    program = struct.pack(
+        "<IIQQQQQQ",
+        1,
+        5,
+        0,
+        0x400000,
+        0x400000,
+        file_size,
+        file_size,
+        0x1000,
+    )
+    return header + program + payload
+
+
+def _valid_pe64(payload: bytes = b"") -> bytes:
+    dos = bytearray(64)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 64)
+    optional = bytearray(0xF0)
+    struct.pack_into("<H", optional, 0, 0x20B)
+    struct.pack_into("<I", optional, 56, 0x1000)
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, len(optional), 0x22)
+    section = bytearray(40)
+    return bytes(dos) + b"PE\x00\x00" + coff + bytes(optional) + bytes(section) + payload
+
+
+def _remote_guard_wire(data: bytes, *, declared_size: int | None = None) -> str:
+    size = len(data) if declared_size is None else declared_size
+    probe = base64.b64encode(data[: 64 * 1024]).decode("ascii")
+    payload = data.decode("latin-1") if size <= 1024 * 1024 else ""
+    return f"__HERMES_GATEWAY_GUARD_V1__:{size}:{probe}\n{payload}"
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +741,22 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily", "restart.sh")
 
+    def test_unresolved_tilde_user_literal_path_is_scanned(self, tmp_path):
+        """Shells leave an unknown ~user token literal; scan that real path."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        literal_dir = tmp_path / "~hermes-user-that-does-not-exist"
+        literal_dir.mkdir()
+        script = literal_dir / "restart.sh"
+        script.write_text("hermes gateway restart\n", encoding="utf-8")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "~hermes-user-that-does-not-exist/restart.sh",
+            cwd=str(tmp_path),
+        ) is True
+
     def test_python_script_with_pathlib_division_not_blocked(self, tmp_path):
         """#77131: a .py cron script using pathlib division (Path.home() /
         ".hermes") must NOT be blocked.
@@ -724,6 +838,53 @@ class TestLifecycleGuardModule:
         assert text is None
         assert unsafe is False
 
+    def test_remote_reader_is_authoritative_over_coincident_local_path(self, tmp_path):
+        """A benign host file must not shadow the remote file that executes."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        collision = tmp_path / "remote-task.sh"
+        collision.write_text("#!/bin/sh\necho host-safe\n", encoding="utf-8")
+        calls = []
+
+        def _remote_read(path: str):
+            calls.append(path)
+            return "#!/bin/sh\nhermes gateway stop\n"
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            str(collision),
+            read_remote_script=_remote_read,
+        ) is True
+        assert calls == [str(collision)]
+
+    def test_remote_reader_does_not_fall_back_to_coincident_local_path(self, tmp_path):
+        """A missing remote path must not cause the host path to be scanned."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        collision = tmp_path / "remote-task.sh"
+        collision.write_text("#!/bin/sh\nhermes gateway stop\n", encoding="utf-8")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            str(collision),
+            read_remote_script=lambda _path: None,
+        ) is False
+
+    def test_remote_reader_exception_fails_closed(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def _failed_read(_path: str):
+            raise OSError("remote protocol failed")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/remote/task.sh",
+            read_remote_script=_failed_read,
+        ) is True
+
     def test_remote_read_fallback_binary_does_not_crash_guard(self):
         """#77703: in the gateway the referenced-script walk carries a
         ``read_remote_script`` fallback (SSH/Modal/Daytona backends read the
@@ -736,11 +897,9 @@ class TestLifecycleGuardModule:
         from cron.lifecycle_guard import (
             contains_gateway_lifecycle_command_or_referenced_script,
         )
-        # Simulates the pre-fix _read_script_in_env handing back an ELF's
-        # decoded bytes (NUL preserved through errors="replace"). The newline
-        # puts a NUL-bearing absolute path in command position, exactly how the
-        # recursion re-tokenized machine code into a bogus script reference.
-        binary_blob = "\x7fELF\x01\x01\n/opt/bin/tool\x00\x01 --run\n"
+        binary_blob = _valid_elf64(
+            b"machine-code hermes gateway restart\x00"
+        ).decode("latin-1")
 
         def _remote_read(_path: str):
             return binary_blob
@@ -750,6 +909,110 @@ class TestLifecycleGuardModule:
             read_remote_script=_remote_read,
         )
         assert result is False
+
+    def test_nul_bearing_local_shell_content_is_still_scanned(self, tmp_path):
+        """A NUL is not sufficient evidence that a referenced file is an
+        executable image.  Shell content before the NUL remains actionable
+        and must not bypass the lifecycle guard."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        script = tmp_path / "nul-wrapper.sh"
+        script.write_bytes(b"#!/bin/bash\nhermes gateway restart\x00trailing-data\n")
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("daily ops", str(script))
+
+    def test_nul_bearing_remote_shell_content_is_still_scanned(self):
+        """Remote callback text follows the same contract as local files:
+        preserve NUL-bearing script text unless executable magic proves it is
+        a compiled binary."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/nul-wrapper.sh",
+            read_remote_script=lambda _path: (
+                "#!/bin/bash\nhermes gateway stop\x00trailing-data\n"
+            ),
+        )
+
+        assert result is True
+
+    def test_remote_wire_valid_macho_is_not_scanned(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        image = _valid_macho64(b"hermes gateway restart\x00")
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/python",
+            read_remote_script=lambda _path: _remote_guard_wire(image),
+        ) is False
+
+    def test_remote_wire_truncated_magic_fails_closed(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        fake = b"\xcf\xfa\xed\xfe\nhermes gateway restart\n"
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/fake-python",
+            read_remote_script=lambda _path: _remote_guard_wire(fake),
+        ) is True
+
+    def test_remote_wire_truncated_or_oversized_payload_fails_closed(self):
+        from cron.lifecycle_guard import (
+            _MAX_REFERENCED_SCRIPT_BYTES,
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        truncated = _remote_guard_wire(b"#!/bin/sh\necho safe\n")[:-3]
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/truncated.sh",
+            read_remote_script=lambda _path: truncated,
+        ) is True
+
+        oversized = _remote_guard_wire(
+            b"x" * (64 * 1024),
+            declared_size=_MAX_REFERENCED_SCRIPT_BYTES + 1,
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/oversized.sh",
+            read_remote_script=lambda _path: oversized,
+        ) is True
+
+    def test_structurally_valid_macho_with_lifecycle_bytes_is_not_scanned(
+        self, tmp_path
+    ):
+        """A validated Mach-O executable may contain coincidental command text."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        executable = tmp_path / "python"
+        executable.write_bytes(_valid_macho64(b"hermes gateway restart\x00"))
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(str(executable))
+            is False
+        )
+
+    def test_truncated_macho_magic_fails_closed(self, tmp_path):
+        """Magic alone cannot prove execve won't fall back to shell parsing."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        executable = tmp_path / "fake-python"
+        executable.write_bytes(
+            b"\xcf\xfa\xed\xfe\nhermes gateway restart\n"
+        )
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(str(executable))
+            is True
+        )
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
@@ -796,7 +1059,9 @@ class TestLifecycleGuardModule:
         )
 
         def _remote_read(_path: str):
-            return "MZ\x00\x00\x90\x00 hermes gateway restart \x00\x00junk"
+            return _valid_pe64(
+                b"machine-code hermes gateway restart\x00"
+            ).decode("latin-1")
 
         result = contains_gateway_lifecycle_command_or_referenced_script(
             "bash /nonexistent/dir/helper.sh",
@@ -1033,7 +1298,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "ssh", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
@@ -1187,7 +1452,7 @@ class TestLifecycleGuardNeverRaises:
         executable path (e.g. a venv python) must scan as 'nothing', not
         crash on the binary's decoded bytes."""
         binary = tmp_path / "python3.11"
-        binary.write_bytes(b"\x7fELF\x02\x01\x01" + bytes(64) + b"\x90" * 256)
+        binary.write_bytes(_valid_elf64())
         assert self._scan(f"{binary} -m json.tool /tmp/x.json") is False
 
     @pytest.mark.parametrize("command", [
@@ -1210,19 +1475,17 @@ class TestLifecycleGuardNeverRaises:
         assert self._scan(f"bash {tmp_path}") is True
         assert self._scan("bash /dev/null") is True
 
-    def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
-        """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
-        guard must not treat compiled binaries as scripts at all."""
+    def test_structurally_valid_binaries_are_not_scanned(self, tmp_path):
+        """Validated ELF/PE/Mach-O images bypass shell-text recursion."""
         from cron.lifecycle_guard import _read_referenced_script
-        for name, magic in [
-            ("elf", b"\x7fELF"),
-            ("pe", b"MZ"),
-            ("macho", b"\xcf\xfa\xed\xfe"),
-            ("fat", b"\xca\xfe\xba\xbe"),
+        for name, image in [
+            ("elf", _valid_elf64()),
+            ("pe", _valid_pe64()),
+            ("macho", _valid_macho64()),
+            ("fat", _valid_fat_macho()),
         ]:
             path = tmp_path / name
-            # No NUL after the magic — proves the magic check itself fires.
-            path.write_bytes(magic + b"ABCDEF" * 10)
+            path.write_bytes(image)
             text, unsafe = _read_referenced_script(path)
             assert text is None, name
             assert unsafe is False, name
@@ -1235,7 +1498,7 @@ class TestLifecycleGuardNeverRaises:
             check_gateway_lifecycle,
         )
         binary = tmp_path / "prog"
-        binary.write_bytes(b"\x7fELF" + bytes(128))
+        binary.write_bytes(_valid_elf64())
         for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh"):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
         for value in ("/dev/null", str(tmp_path)):

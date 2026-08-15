@@ -29405,7 +29405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             content=_final,
                             finalize=True,
                         )
-                        if getattr(_reconcile_res, "success", True):
+                        if getattr(_reconcile_res, "success", False) is True:
                             from gateway.platforms.base import (
                                 ordered_send_result_message_ids,
                             )

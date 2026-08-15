@@ -383,6 +383,28 @@ class TestSegmentBreakOnToolBoundary:
         # The undelivered "world" tail must reach the user, and the next
         # segment must not duplicate "Hello" that was already visible.
         assert sent_texts == ["Hello ▉", "world", "Next segment"]
+        assert consumer.platform_message_ids == ("msg_1", "msg_2", "msg_3")
+
+    @pytest.mark.asyncio
+    async def test_cursor_strip_tracks_remapped_edit_message_ids(self):
+        adapter = MagicMock()
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="msg_remapped",
+                continuation_message_ids=("msg_remapped",),
+            )
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        config = StreamConsumerConfig(cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+        consumer._message_id = "msg_original"
+        consumer._last_sent_text = "Visible prefix ▉"
+        consumer._track_preview_id("msg_original")
+
+        await consumer._try_strip_cursor()
+
+        assert consumer.platform_message_ids == ("msg_original", "msg_remapped")
 
     @pytest.mark.asyncio
     async def test_segment_break_after_mid_stream_edit_failure_preserves_tail(self):

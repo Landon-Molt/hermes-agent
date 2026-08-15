@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,7 @@ from gateway.platforms.base import (
     RESPONSE_DELIVERY_RECEIPT_KEY,
     BasePlatformAdapter,
     MessageEvent,
+    MessageType,
     SendResult,
 )
 from gateway.run import GatewayRunner, _prepare_gateway_response_for_delivery
@@ -284,6 +286,94 @@ async def test_failed_send_does_not_emit_response_delivered():
 
     runner.hooks.emit.assert_not_awaited()
     assert RESPONSE_DELIVERY_RECEIPT_KEY not in event.metadata
+
+
+@pytest.mark.asyncio
+async def test_audio_success_does_not_confirm_failed_authoritative_text(
+    monkeypatch, tmp_path
+):
+    runner, adapter, event, source = _setup()
+    session_key = "agent:main:telegram:dm:100000001:9001"
+    interrupt_event = asyncio.Event()
+    setattr(interrupt_event, "_hermes_run_generation", 7)
+    adapter._active_sessions[session_key] = interrupt_event
+    event.message_type = MessageType.VOICE
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
+    adapter.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="audio-1")
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"audio")
+
+    from tools import tts_tool
+
+    monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: True)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps(
+            {"success": True, "file_path": str(audio_path)}
+        ),
+    )
+    adapter.set_message_handler(AsyncMock(return_value="最终权威文本。" * 300))
+    _register(runner, event, source)
+
+    await adapter._process_message_background(event, session_key)
+    await _drain_hook_tasks(runner)
+
+    adapter.play_tts.assert_awaited_once()
+    assert adapter.send.await_count >= 1
+    runner.hooks.emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multi_file_tts_keeps_authoritative_caption_receipt(monkeypatch, tmp_path):
+    runner, adapter, event, source = _setup()
+    session_key = "agent:main:telegram:dm:100000001:9001"
+    interrupt_event = asyncio.Event()
+    setattr(interrupt_event, "_hermes_run_generation", 7)
+    adapter._active_sessions[session_key] = interrupt_event
+    event.message_type = MessageType.VOICE
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
+    adapter.play_tts = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="caption-audio-1"),
+            SendResult(success=True, message_id="voice-only-2"),
+        ]
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text-3"))
+    first_audio = tmp_path / "reply-1.ogg"
+    second_audio = tmp_path / "reply-2.ogg"
+    first_audio.write_bytes(b"audio-1")
+    second_audio.write_bytes(b"audio-2")
+
+    from tools import tts_tool
+
+    monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: True)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps(
+            {
+                "success": True,
+                "file_paths": [str(first_audio), str(second_audio)],
+            }
+        ),
+    )
+    adapter.set_message_handler(AsyncMock(return_value="短回复，使用首段语音 caption。"))
+    _register(runner, event, source)
+
+    await adapter._process_message_background(event, session_key)
+    await _drain_hook_tasks(runner)
+
+    assert adapter.play_tts.await_count == 2
+    adapter.send.assert_not_awaited()
+    runner.hooks.emit.assert_awaited_once()
+    context = runner.hooks.emit.await_args.args[1]
+    assert context["delivery_message_id"] == "caption-audio-1"
+    assert context["platform_message_ids"] == ["caption-audio-1"]
+    assert context["delivery_mode"] == "tts_caption"
 
 
 @pytest.mark.asyncio

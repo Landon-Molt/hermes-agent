@@ -61,6 +61,27 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class QueuedDeliveryCaptureAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._delivery_id = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._delivery_id += 1
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(
+            success=True,
+            message_id=f"queued-out-{self._delivery_id}",
+        )
+
+
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
     """Capture sends while exercising Discord's real preview formatter."""
 
@@ -1504,6 +1525,7 @@ async def test_queued_followups_emit_once_with_each_effective_event(monkeypatch,
             "streaming": {"enabled": False},
         },
         delivery_event=outer_event,
+        adapter_cls=QueuedDeliveryCaptureAdapter,
         return_runner=True,
     )
 
@@ -1519,14 +1541,15 @@ async def test_queued_followups_emit_once_with_each_effective_event(monkeypatch,
     assert first_events[0]["request"] == "hello"
     assert first_events[0]["response"] == "final response 1"
 
-    # The leaf response carries the queued event, not the outer event, to the
-    # normal BasePlatformAdapter delivery boundary.
+    # Register exactly as _handle_message_with_agent does, then let the real
+    # BasePlatformAdapter send/finally boundary create and consume the receipt.
     delivery = result["_response_delivery_context"]
     queued_event = delivery["event"]
     assert queued_event.message_id == "queued-1"
     assert delivery["request"] == "queued follow-up"
     runner._register_response_delivered_hook(
         event=queued_event,
+        receipt_event=outer_event,
         source=delivery["source"],
         session_key=delivery["session_key"],
         session_id="sess-queued-deliveries",
@@ -1534,19 +1557,16 @@ async def test_queued_followups_emit_once_with_each_effective_event(monkeypatch,
         request_text=delivery["request"],
         response_text=result["final_response"],
     )
-    queued_event.metadata[base_platform.RESPONSE_DELIVERY_RECEIPT_KEY] = {
-        "success": True,
-        "message_id": "queued-out",
-        "message_ids": ["queued-out"],
-        "mode": "text",
-    }
-    callback = adapter.pop_post_delivery_callback(
-        delivery["session_key"], generation=7
+
+    async def _deliver_leaf(_event):
+        return result["final_response"]
+
+    setattr(outer_event, "_hermes_run_generation", 7)
+    adapter.set_message_handler(_deliver_leaf)
+    await adapter._process_message_background(
+        outer_event,
+        delivery["session_key"],
     )
-    assert callback is not None
-    callback_result = callback()
-    if inspect.isawaitable(callback_result):
-        await callback_result
     await asyncio.gather(*list(runner._background_tasks))
 
     delivered_events = [
@@ -1566,6 +1586,13 @@ async def test_queued_followups_emit_once_with_each_effective_event(monkeypatch,
         "final response 1",
         "final response 2",
     ]
+    assert [item["platform_message_ids"] for item in delivered_events] == [
+        ["queued-out-1"],
+        ["queued-out-2"],
+    ]
+    assert [item["chat_id"] for item in delivered_events] == ["-1001", "-1001"]
+    assert [item["thread_id"] for item in delivered_events] == ["17585", "17585"]
+    assert [item["profile"] for item in delivered_events] == ["default", "default"]
 
 
 @pytest.mark.asyncio

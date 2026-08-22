@@ -35,11 +35,14 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import os
 import re
 import shlex
 import stat
+import struct
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -158,18 +161,23 @@ _PIPE_TO_INTERPRETER = re.compile(
 )
 
 # Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
-# both endiannesses). A referenced file starting with one of these is a
-# compiled binary, never a shell script — don't read or scan it at all.
+# both endiannesses). Magic is only a classifier; the corresponding format
+# must also pass bounded structural validation before the guard skips it.
 _BINARY_MAGIC_PREFIXES = (
     b"\x7fELF",
     b"MZ",
     b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
     b"\xcf\xfa\xed\xfe",
     b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xce",
     b"\xfe\xed\xfa\xcf",
 )
-_BINARY_SNIFF_BYTES = 4096
+_EXECUTABLE_PROBE_BYTES = 64 * 1024
+_REMOTE_SCRIPT_WIRE_PREFIX = "__HERMES_GATEWAY_GUARD_V1__:"
+_REMOTE_SCRIPT_UNSAFE_SENTINEL = "__HERMES_GATEWAY_GUARD_UNSAFE__"
 
 
 
@@ -345,15 +353,16 @@ def _expand_candidate_path(candidate: str) -> Optional[Path]:
     the whole-class fix; catching per-syscall was the whack-a-mole that
     produced #76762, #77703, #77780, and #78256.
 
-    Returns ``None`` for candidates that cannot be a real path (nothing to
-    scan), otherwise the ``expanduser()``-expanded ``Path``.
+    Returns ``None`` for candidates that cannot be a real path. If ``~user``
+    cannot be expanded, preserve the literal word because POSIX shells do too.
     """
     if not candidate or "\x00" in candidate:
         return None
+    path = Path(candidate)
     try:
-        return Path(candidate).expanduser()
+        return path.expanduser()
     except (ValueError, RuntimeError, OSError):
-        return None
+        return path
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
@@ -451,6 +460,251 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
+def _region_fits(offset: int, length: int, file_size: int) -> bool:
+    return offset >= 0 and length >= 0 and offset <= file_size - length
+
+
+def _valid_elf_image(data: bytes, file_size: int) -> bool:
+    if len(data) < 16 or data[:4] != b"\x7fELF":
+        return False
+    elf_class, encoding, version = data[4], data[5], data[6]
+    if elf_class not in {1, 2} or encoding not in {1, 2} or version != 1:
+        return False
+    endian = "<" if encoding == 1 else ">"
+    fmt = endian + ("HHIIIIIHHHHHH" if elf_class == 1 else "HHIQQQIHHHHHH")
+    header_size = 52 if elf_class == 1 else 64
+    program_header_size = 32 if elf_class == 1 else 56
+    try:
+        fields = struct.unpack_from(fmt, data, 16)
+    except struct.error:
+        return False
+    (
+        image_type,
+        machine,
+        image_version,
+        _entry,
+        program_offset,
+        _section_offset,
+        _flags,
+        encoded_header_size,
+        encoded_program_size,
+        program_count,
+        *_rest,
+    ) = fields
+    if (
+        image_type not in {2, 3}
+        or machine == 0
+        or image_version != 1
+        or encoded_header_size != header_size
+        or encoded_program_size < program_header_size
+        or program_count < 1
+        or not _region_fits(
+            program_offset, encoded_program_size * program_count, file_size
+        )
+        or program_offset + encoded_program_size * program_count > len(data)
+    ):
+        return False
+    has_load_segment = False
+    for index in range(program_count):
+        offset = program_offset + index * encoded_program_size
+        try:
+            if elf_class == 1:
+                values = struct.unpack_from(endian + "IIIIIIII", data, offset)
+                segment_type, file_offset, file_bytes, memory_bytes = (
+                    values[0], values[1], values[4], values[5]
+                )
+            else:
+                values = struct.unpack_from(endian + "IIQQQQQQ", data, offset)
+                segment_type, file_offset, file_bytes, memory_bytes = (
+                    values[0], values[2], values[5], values[6]
+                )
+        except struct.error:
+            return False
+        if segment_type == 1:
+            if file_bytes > memory_bytes or not _region_fits(
+                file_offset, file_bytes, file_size
+            ):
+                return False
+            has_load_segment = True
+    return has_load_segment
+
+
+def _valid_thin_macho_image(data: bytes, file_size: int) -> bool:
+    variants = {
+        b"\xce\xfa\xed\xfe": ("<", False),
+        b"\xfe\xed\xfa\xce": (">", False),
+        b"\xcf\xfa\xed\xfe": ("<", True),
+        b"\xfe\xed\xfa\xcf": (">", True),
+    }
+    variant = variants.get(data[:4])
+    if variant is None:
+        return False
+    endian, is_64_bit = variant
+    header_size = 32 if is_64_bit else 28
+    fmt = endian + ("iiIIIII" if is_64_bit else "iiIIII")
+    try:
+        fields = struct.unpack_from(fmt, data, 4)
+    except struct.error:
+        return False
+    if is_64_bit:
+        cpu_type, _cpu_subtype, file_type, command_count, command_bytes, *_ = fields
+    else:
+        cpu_type, _cpu_subtype, file_type, command_count, command_bytes, _flags = fields
+    command_end = header_size + command_bytes
+    if (
+        cpu_type == 0
+        or file_type != 2
+        or command_count < 1
+        or command_count > 65535
+        or not _region_fits(header_size, command_bytes, file_size)
+        or command_end > len(data)
+    ):
+        return False
+    position = header_size
+    has_segment = False
+    for _ in range(command_count):
+        try:
+            command, command_size = struct.unpack_from(endian + "II", data, position)
+        except struct.error:
+            return False
+        if command_size < 8 or position + command_size > command_end:
+            return False
+        if command == 0x19 and command_size >= 72:
+            try:
+                file_offset, file_bytes = struct.unpack_from(
+                    endian + "QQ", data, position + 40
+                )
+            except struct.error:
+                return False
+            if not _region_fits(file_offset, file_bytes, file_size):
+                return False
+            has_segment = True
+        elif command == 0x1 and command_size >= 56:
+            try:
+                file_offset, file_bytes = struct.unpack_from(
+                    endian + "II", data, position + 32
+                )
+            except struct.error:
+                return False
+            if not _region_fits(file_offset, file_bytes, file_size):
+                return False
+            has_segment = True
+        position += command_size
+    return has_segment and position == command_end
+
+
+def _valid_fat_macho_image(data: bytes, file_size: int) -> bool:
+    variants = {
+        b"\xca\xfe\xba\xbe": (">", False),
+        b"\xbe\xba\xfe\xca": ("<", False),
+        b"\xca\xfe\xba\xbf": (">", True),
+        b"\xbf\xba\xfe\xca": ("<", True),
+    }
+    variant = variants.get(data[:4])
+    if variant is None:
+        return False
+    endian, is_64_bit = variant
+    try:
+        architecture_count = struct.unpack_from(endian + "I", data, 4)[0]
+    except struct.error:
+        return False
+    entry_size = 32 if is_64_bit else 20
+    table_end = 8 + architecture_count * entry_size
+    if architecture_count < 1 or architecture_count > 128 or table_end > len(data):
+        return False
+    for index in range(architecture_count):
+        position = 8 + index * entry_size
+        try:
+            if is_64_bit:
+                _cpu, _subtype, offset, size, _align, _reserved = struct.unpack_from(
+                    endian + "iiQQII", data, position
+                )
+            else:
+                _cpu, _subtype, offset, size, _align = struct.unpack_from(
+                    endian + "iiIII", data, position
+                )
+        except struct.error:
+            return False
+        if size < 4 or offset < table_end or not _region_fits(offset, size, file_size):
+            return False
+        if offset + 4 > len(data):
+            return False
+        slice_data = data[offset : min(offset + size, len(data))]
+        if not _valid_thin_macho_image(slice_data, size):
+            return False
+    return True
+
+
+def _valid_pe_image(data: bytes, file_size: int) -> bool:
+    if len(data) < 64 or data[:2] != b"MZ":
+        return False
+    try:
+        pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    except struct.error:
+        return False
+    if pe_offset < 64 or pe_offset + 24 > len(data):
+        return False
+    if data[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+        return False
+    try:
+        machine, section_count, _time, _symbols, _symbol_count, optional_size, _flags = (
+            struct.unpack_from("<HHIIIHH", data, pe_offset + 4)
+        )
+    except struct.error:
+        return False
+    optional_offset = pe_offset + 24
+    section_offset = optional_offset + optional_size
+    if (
+        machine == 0
+        or section_count < 1
+        or section_count > 96
+        or optional_size < 60
+        or section_offset + section_count * 40 > len(data)
+    ):
+        return False
+    try:
+        optional_magic = struct.unpack_from("<H", data, optional_offset)[0]
+        image_size = struct.unpack_from("<I", data, optional_offset + 56)[0]
+    except struct.error:
+        return False
+    if optional_magic not in {0x10B, 0x20B} or image_size == 0:
+        return False
+    for index in range(section_count):
+        position = section_offset + index * 40
+        try:
+            raw_size, raw_offset = struct.unpack_from("<II", data, position + 16)
+        except struct.error:
+            return False
+        if raw_size and not _region_fits(raw_offset, raw_size, file_size):
+            return False
+    return True
+
+
+def _is_structurally_valid_executable_image(data: bytes, file_size: int) -> bool:
+    """Reject magic-only impostors that a shell could interpret after ENOEXEC."""
+    if file_size < 1 or len(data) < min(file_size, 4):
+        return False
+    if data.startswith(b"\x7fELF"):
+        return _valid_elf_image(data, file_size)
+    if data.startswith(b"MZ"):
+        return _valid_pe_image(data, file_size)
+    if data[:4] in {
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xce",
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+    }:
+        return _valid_thin_macho_image(data, file_size)
+    if data[:4] in {
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }:
+        return _valid_fat_macho_image(data, file_size)
+    return False
+
+
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
 
@@ -478,11 +732,6 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
-        # OSError: unreadable / missing / over-long paths. ValueError: an
-        # embedded NUL byte in *path* itself — a binary's decoded bytes
-        # tokenized into a bogus script path by the recursion (#77703). A
-        # guarded read must never crash the guard, so treat either as
-        # "nothing to scan" (mirrors the resolve() ValueError guard below).
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -495,61 +744,79 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
             if stat.S_ISDIR(metadata.st_mode):
                 return None, False
             return None, True
-        # Sniff a small prefix first: files that are clearly compiled
-        # binaries (executable magic, or NUL bytes in the head) are never
-        # shell scripts, so skip them WITHOUT reading the rest — reading a
-        # megabyte of machine code just to discard it wastes the guard's
-        # budget and (pre-#77703) fed decoded garbage into the recursion.
-        data = os.read(descriptor, _BINARY_SNIFF_BYTES)
-        if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
-            return None, False
-        # Read the remainder (bounded). Loop because os.read may return
-        # short for non-regular-file-backed descriptors.
-        while len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-            chunk = os.read(
-                descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1 - len(data)
-            )
+        read_limit = min(metadata.st_size, _MAX_REFERENCED_SCRIPT_BYTES + 1)
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read < read_limit:
+            chunk = os.read(descriptor, read_limit - bytes_read)
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        data = b"".join(chunks)
     except OSError:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
-    if b"\x00" in data:
-        return None, False
-    if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
+    # A concurrent short read is ambiguous: never let a truncated safety view
+    # authorize a command that will execute a different/full file.
+    if len(data) != read_limit:
+        return None, True
+    if data.startswith(_BINARY_MAGIC_PREFIXES):
+        if _is_structurally_valid_executable_image(data, metadata.st_size):
+            return None, False
+        return None, True
+    if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
 
 
-def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bool]:
-    """Apply the local-read contract to text from a ``read_remote_script`` callback.
+def _latin1_bytes(text: str) -> Optional[bytes]:
+    try:
+        return text.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
 
-    The recursion boundary must not trust its callbacks: any backend (SSH,
-    Modal, Daytona, or a future one) can hand back raw binary bytes decoded
-    as text, or arbitrarily large output. Mirror
-    ``_read_referenced_script``'s semantics exactly — NUL bytes mean binary
-    (nothing to scan, checked first, #77703), oversized text fails closed
-    like an oversized local file (#76762) — so remote and local reads can
-    never diverge again. The size check re-encodes to compare *bytes*
-    (matching the local read and the ``head -c`` wire bound): a >1 MiB
-    multibyte file truncated at the byte cap decodes to fewer characters
-    than bytes, and a character-count check would scan the truncated text
-    instead of failing closed. Enforced here rather than inside each
-    callback so the guarantee holds for every callback, not just the ones
-    we hardened.
-    """
+
+def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bool]:
+    """Validate a bounded remote-read envelope before recursive scanning."""
     if not text:
         return None, False
-    if "\x00" in text:
-        return None, False
+    if text == _REMOTE_SCRIPT_UNSAFE_SENTINEL:
+        return None, True
+    if text.startswith(_REMOTE_SCRIPT_WIRE_PREFIX):
+        header, separator, payload = text.partition("\n")
+        if not separator:
+            return None, True
+        fields = header[len(_REMOTE_SCRIPT_WIRE_PREFIX) :].split(":", 1)
+        if len(fields) != 2:
+            return None, True
+        try:
+            file_size = int(fields[0])
+            probe = base64.b64decode(fields[1], validate=True)
+        except (ValueError, binascii.Error):
+            return None, True
+        expected_probe_size = min(file_size, _EXECUTABLE_PROBE_BYTES)
+        if file_size < 0 or len(probe) != expected_probe_size:
+            return None, True
+        if probe.startswith(_BINARY_MAGIC_PREFIXES):
+            if _is_structurally_valid_executable_image(probe, file_size):
+                return None, False
+            return None, True
+        if file_size > _MAX_REFERENCED_SCRIPT_BYTES:
+            return None, True
+        if len(payload.encode("utf-8", errors="replace")) != file_size:
+            return None, True
+        return payload, False
+
+    # Compatibility for third-party callbacks that still return a raw string.
+    # They do not carry an independent size/probe envelope, so magic-only data
+    # must prove its structure from the returned bytes or fail closed.
+    raw = _latin1_bytes(text)
+    if raw is not None and raw.startswith(_BINARY_MAGIC_PREFIXES):
+        if _is_structurally_valid_executable_image(raw, len(raw)):
+            return None, False
+        return None, True
     if len(text.encode("utf-8", errors="replace")) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return text, False
@@ -599,19 +866,23 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        if read_remote_script is not None:
+            # A supplied reader represents the backend that will actually
+            # execute this path and is authoritative. Never let a coincident
+            # host path shadow SSH/container/sandbox content.
+            try:
+                remote_content = read_remote_script(str(script_path))
+            except Exception:
+                # A backend/protocol failure means the executable content
+                # could not be inspected. Block without logging remote paths
+                # or exception payloads, which may contain private data.
+                logger.warning("lifecycle guard backend script read failed; blocking")
+                return True
+            script_text, unsafe = _sanitize_remote_script_text(remote_content)
+        else:
+            script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
-            # The callback's output crosses the same trust boundary as a
-            # local read — sanitize it identically before it enters the
-            # recursion (binary skip + size fail-closed).
-            script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
-            )
-            if unsafe:
-                return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's

@@ -62,6 +62,23 @@ def _valid_fat_macho() -> bytes:
     return header + architecture + thin
 
 
+def _fat_macho_with_valid_and_malformed_slice() -> bytes:
+    """Build a FAT image whose second declared slice is not a valid Mach-O."""
+    valid = _valid_macho64()
+    malformed = b"\xcf\xfa\xed\xfehermes gateway restart\n"
+    table_end = 8 + 2 * 20
+    valid_offset = table_end
+    malformed_offset = valid_offset + len(valid)
+    header = b"\xca\xfe\xba\xbe" + struct.pack(">I", 2)
+    architectures = b"".join(
+        (
+            struct.pack(">iiIII", 0x01000007, 0, valid_offset, len(valid), 2),
+            struct.pack(">iiIII", 0x0100000C, 0, malformed_offset, len(malformed), 2),
+        )
+    )
+    return header + architectures + valid + malformed
+
+
 def _valid_elf64(payload: bytes = b"") -> bytes:
     header_size = 64
     program_size = 56
@@ -1669,6 +1686,18 @@ class TestLifecycleGuardNeverRaises:
             text, unsafe = _read_referenced_script(path)
             assert text is None, name
             assert unsafe is False, name
+
+    def test_fat_macho_with_malformed_declared_slice_fails_closed(self, tmp_path):
+        """Every declared FAT slice must validate before binary scanning is skipped."""
+        from cron.lifecycle_guard import _read_referenced_script
+
+        path = tmp_path / "mixed-fat"
+        path.write_bytes(_fat_macho_with_valid_and_malformed_slice())
+
+        text, unsafe = _read_referenced_script(path)
+
+        assert unsafe is True
+        assert text is None
 
     def test_check_gateway_lifecycle_adversarial_script_values(self, tmp_path):
         """check_gateway_lifecycle must never raise anything but the

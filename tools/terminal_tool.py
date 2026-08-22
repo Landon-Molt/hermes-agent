@@ -429,6 +429,71 @@ def _validate_workdir(workdir: str) -> str | None:
     return None
 
 
+def _read_script_for_gateway_guard(
+    *,
+    env,
+    env_type: str,
+    script_path: str,
+    guard_cwd: str,
+    max_bytes: int,
+) -> Optional[str]:
+    """Read a referenced script under the backend that will execute it."""
+    if env is None:
+        return None
+
+    from cron.lifecycle_guard import (
+        _BINARY_MAGIC_PREFIXES,
+        _EXECUTABLE_PROBE_BYTES,
+        _REMOTE_SCRIPT_UNSAFE_SENTINEL,
+        _REMOTE_SCRIPT_WIRE_PREFIX,
+        _is_structurally_valid_executable_image,
+    )
+
+    if isinstance(env, _LocalEnvironment):
+        try:
+            local_path = Path(script_path).expanduser()
+            if not local_path.is_absolute():
+                local_path = Path(guard_cwd) / local_path
+            if not local_path.exists():
+                return None
+            metadata = local_path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+            with local_path.open("rb") as handle:
+                data = handle.read(max_bytes + 1)
+            if data.startswith(_BINARY_MAGIC_PREFIXES):
+                if _is_structurally_valid_executable_image(data, metadata.st_size):
+                    return ""
+                return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+            if metadata.st_size > max_bytes or len(data) > max_bytes:
+                return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+            return data.decode("utf-8", errors="replace")
+        except (OSError, RuntimeError, ValueError):
+            return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+
+    quoted_path = shlex.quote(script_path)
+    command = (
+        f"__hermes_guard_size=$(LC_ALL=C wc -c < {quoted_path}) || exit 66; "
+        f"printf '{_REMOTE_SCRIPT_WIRE_PREFIX}%s:' \"$__hermes_guard_size\"; "
+        f"head -c {_EXECUTABLE_PROBE_BYTES} < {quoted_path} | "
+        "base64 | tr -d '\\n'; "
+        "printf '\\n'; "
+        f"if [ \"$__hermes_guard_size\" -le {max_bytes} ]; then "
+        f"head -c \"$__hermes_guard_size\" < {quoted_path}; fi"
+    )
+    try:
+        result = env.execute(command)
+        if result.get("returncode", -1) != 0:
+            return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+        output = result.get("output", "")
+        text = output if isinstance(output, str) else str(output or "")
+        if not text.startswith(_REMOTE_SCRIPT_WIRE_PREFIX):
+            return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+        return text
+    except Exception:
+        return _REMOTE_SCRIPT_UNSAFE_SENTINEL
+
+
 def _handle_sudo_failure(output: str, env_type: str) -> str:
     """
     Check for sudo failure and add helpful message for messaging contexts.
@@ -2904,65 +2969,23 @@ def terminal_tool(
                 env_type=env_type,
             )
 
-            def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
-                """
-                if env is None:
-                    return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
-                            data = local_path.read_bytes()
-                            if len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-                                if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
-                                    return None
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                # Bound the read at the source with `head -c` so an oversized
-                # file (e.g. a 166MB ELF invoked by absolute path) never
-                # crosses the wire — `cat` of such a binary previously pinned
-                # the gateway's tool thread on a superlinear shlex scan for
-                # 30+ minutes. One byte over the guard's budget is enough for
-                # lifecycle_guard's sanitizer to fail the oversized case
-                # closed, mirroring the local-read semantics. The `< path`
-                # redirect keeps leading-dash paths out of argv (same form as
-                # tools/image_source.py).
-                try:
-                    result = env.execute(
-                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
+            read_backend_script = None
+            if env_type != "local":
+                def _read_script_in_env(script_path: str) -> Optional[str]:
+                    return _read_script_for_gateway_guard(
+                        env=env,
+                        env_type=env_type,
+                        script_path=script_path,
+                        guard_cwd=guard_cwd,
+                        max_bytes=_MAX_REFERENCED_SCRIPT_BYTES,
                     )
-                    if result.get("returncode", -1) == 0:
-                        output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote read: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
-                except Exception:
-                    pass
-                return None
+
+                read_backend_script = _read_script_in_env
 
             if contains_gateway_lifecycle_command_or_referenced_script(
                 command,
                 cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
+                read_remote_script=read_backend_script,
             ):
                 return json.dumps({
                     "output": "",

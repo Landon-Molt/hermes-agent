@@ -6342,13 +6342,15 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
 
-        def _record_delivery(result):
+        def _record_delivery(result, *, record_response_receipt: bool = True):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                if not record_response_receipt:
+                    return
                 current = event.metadata.get(RESPONSE_DELIVERY_RECEIPT_KEY)
                 prior_ids = (
                     list(current.get("message_ids") or [])
@@ -6611,15 +6613,17 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
-                        _record_delivery(tts_result)
-                        _tts_caption_delivered = bool(
-                            _tts_caption_delivered
-                            or (
-                                telegram_tts_caption
-                                and getattr(tts_result, "success", False)
-                            )
-                        )
-                        if _tts_caption_delivered:
+                        # A voice-only audio send counts toward the processing
+                        # outcome but is not proof that the authoritative text
+                        # response was delivered. A successful caption gets its
+                        # dedicated receipt below; otherwise only the later text
+                        # send may confirm ``response:delivered``.
+                        _record_delivery(tts_result, record_response_receipt=False)
+                        if (
+                            telegram_tts_caption
+                            and getattr(tts_result, "success", False)
+                        ):
+                            _tts_caption_delivered = True
                             message_ids = ordered_send_result_message_ids(tts_result)
                             event.metadata[RESPONSE_DELIVERY_RECEIPT_KEY] = {
                                 "success": True,

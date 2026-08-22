@@ -2073,6 +2073,7 @@ class GatewayStreamConsumer:
             )
             if result.success:
                 self._already_sent = True
+                self._track_preview_ids_from_result(result)
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 
@@ -2093,6 +2094,10 @@ class GatewayStreamConsumer:
                 content=prefix,
             )
             if getattr(result, "success", False):
+                self._track_preview_ids_from_result(
+                    result,
+                    edited_message_id=self._message_id,
+                )
                 self._last_sent_text = prefix
         except Exception:
             pass  # best-effort — don't let this block the fallback path
